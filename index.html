@@ -43,7 +43,7 @@ window.storage = {
 };
 </script>
 
-<script type="text/babel" data-presets="react">
+<script id="app-source" type="text/plain">
 const { useState, useEffect, useCallback } = React;
 
 
@@ -874,6 +874,27 @@ function Detail({ session, onBack, onDelete }) {
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<GymTracker />);
+</script>
+
+<script>
+  // The raw JSX above is stored as inert text (type="text/plain" is never
+  // auto-executed or auto-scanned by the browser or by Babel's script-tag
+  // loader). We transform it ourselves with the classic JSX runtime so the
+  // output uses React.createElement directly, with no jsx-runtime require()
+  // or ES module syntax that a plain <script> tag can't support.
+  const rawSource = document.getElementById("app-source").textContent;
+  try {
+    const { code } = Babel.transform(rawSource, {
+      presets: [["react", { runtime: "classic" }]],
+    });
+    (0, eval)(code); // eslint-disable-line no-eval
+  } catch (e) {
+    document.getElementById("root").innerHTML =
+      '<div style="color:#F2F1ED;background:#16171B;padding:24px;font-family:monospace;">App failed to start: ' +
+      (e && e.message ? e.message : e) +
+      "</div>";
+    console.error(e);
+  }
 </script>
 
 <script>
