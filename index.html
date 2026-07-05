@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Iron Log" />
+<meta name="theme-color" content="#16171B" />
+<title>Iron Log</title>
+<link rel="manifest" href="manifest.json" />
+<style>
+  html, body { margin: 0; padding: 0; background: #16171B; }
+  #root { min-height: 100vh; }
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+// ---- localStorage-backed storage shim, matching the window.storage API ----
+window.storage = {
+  async get(key) {
+    const v = localStorage.getItem(key);
+    if (v === null) throw new Error("not found");
+    return { key, value: v, shared: false };
+  },
+  async set(key, value) {
+    localStorage.setItem(key, value);
+    return { key, value, shared: false };
+  },
+  async delete(key) {
+    localStorage.removeItem(key);
+    return { key, deleted: true, shared: false };
+  },
+  async list(prefix) {
+    const keys = Object.keys(localStorage).filter((k) => !prefix || k.startsWith(prefix));
+    return { keys, prefix, shared: false };
+  },
+};
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback } = React;
+
+
+const DAYS = ["push", "pull", "legs", "abs"];
+
+const DAY_META = {
+  push: { label: "Push", accent: "#FF6B4A", accentDim: "#3a2620" },
+  pull: { label: "Pull", accent: "#4FA3F7", accentDim: "#1f2b38" },
+  legs: { label: "Legs", accent: "#6FE07A", accentDim: "#213328" },
+  abs: { label: "Abs", accent: "#F7C948", accentDim: "#332c1a" },
+};
+
+const DEFAULT_CONFIG = {
+  push: ["Bench Press", "Overhead Press", "Incline DB Press", "Triceps Pushdown"],
+  pull: ["Deadlift", "Barbell Row", "Lat Pulldown", "Bicep Curl"],
+  legs: ["Squat", "Leg Press", "Romanian Deadlift", "Calf Raise"],
+  abs: ["Hanging Leg Raise", "Cable Crunch", "Plank", "Russian Twist"],
+};
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+function todayLabel() {
+  return new Date().toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function GymTracker() {
+  const [screen, setScreen] = useState("home"); // home | manage | workout | history | detail
+  const [config, setConfig] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [toast, setToast] = useState("");
+
+  const [session, setSession] = useState(null); // active workout session
+  const [draft, setDraft] = useState({}); // exerciseName -> array of {weight, reps}
+  const [manageDay, setManageDay] = useState("push");
+  const [newExName, setNewExName] = useState("");
+
+  const [sessions, setSessions] = useState([]); // history list
+  const [detailSession, setDetailSession] = useState(null);
+  const [confirmState, setConfirmState] = useState(null); // {message, confirmLabel, onConfirm}
+
+  function askConfirm(message, onConfirm, confirmLabel) {
+    setConfirmState({ message, onConfirm, confirmLabel: confirmLabel || "Confirm" });
+  }
+
+  // ---- load config on mount ----
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await window.storage.get("config");
+        if (result && result.value) {
+          setConfig(JSON.parse(result.value));
+        } else {
+          setConfig(DEFAULT_CONFIG);
+          await window.storage.set("config", JSON.stringify(DEFAULT_CONFIG), false);
+        }
+      } catch (e) {
+        setConfig(DEFAULT_CONFIG);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  function showToast(msg) {
+    setToast(msg);
+    setTimeout(() => setToast(""), 1800);
+  }
+
+  async function saveConfig(next) {
+    setConfig(next);
+    try {
+      await window.storage.set("config", JSON.stringify(next), false);
+    } catch (e) {
+      setError("Couldn't save your changes. Try again.");
+    }
+  }
+
+  function startWorkout(day) {
+    const exercises = (config[day] || []).map((name) => ({ name, sets: [] }));
+    setSession({ id: uid(), day, date: new Date().toISOString(), exercises });
+    setDraft({});
+    setScreen("workout");
+  }
+
+  function beginAddSet(exName) {
+    setDraft((d) => ({ ...d, [exName]: [{ weight: "", reps: "" }] }));
+  }
+
+  function cancelAddSet(exName) {
+    setDraft((d) => {
+      const next = { ...d };
+      delete next[exName];
+      return next;
+    });
+  }
+
+  function updateDraftPart(exName, idx, field, value) {
+    setDraft((d) => {
+      const parts = d[exName].map((p, i) => (i === idx ? { ...p, [field]: value } : p));
+      return { ...d, [exName]: parts };
+    });
+  }
+
+  function addDropdown(exName) {
+    setDraft((d) => ({ ...d, [exName]: [...d[exName], { weight: "", reps: "" }] }));
+  }
+
+  function removeDraftPart(exName, idx) {
+    setDraft((d) => {
+      const parts = d[exName].filter((_, i) => i !== idx);
+      return { ...d, [exName]: parts };
+    });
+  }
+
+  function saveSet(exName) {
+    const parts = (draft[exName] || [])
+      .map((p) => ({ weight: parseFloat(p.weight), reps: parseInt(p.reps, 10) }))
+      .filter((p) => !isNaN(p.weight) && !isNaN(p.reps));
+    if (parts.length === 0) {
+      cancelAddSet(exName);
+      return;
+    }
+    setSession((s) => ({
+      ...s,
+      exercises: s.exercises.map((ex) =>
+        ex.name === exName ? { ...ex, sets: [...ex.sets, { id: uid(), parts }] } : ex
+      ),
+    }));
+    cancelAddSet(exName);
+  }
+
+  function deleteSet(exName, setId) {
+    setSession((s) => ({
+      ...s,
+      exercises: s.exercises.map((ex) =>
+        ex.name === exName ? { ...ex, sets: ex.sets.filter((st) => st.id !== setId) } : ex
+      ),
+    }));
+  }
+
+  async function actuallyFinishWorkout() {
+    try {
+      await window.storage.set(`sessions:${session.id}`, JSON.stringify(session), false);
+      showToast("Workout saved");
+    } catch (e) {
+      setError("Couldn't save your workout.");
+    }
+    setSession(null);
+    setScreen("home");
+  }
+
+  function finishWorkout() {
+    if (!session) return;
+    const hasAnySets = session.exercises.some((ex) => ex.sets.length > 0);
+    if (!hasAnySets) {
+      askConfirm("No sets logged. Finish anyway?", actuallyFinishWorkout, "Finish");
+      return;
+    }
+    actuallyFinishWorkout();
+  }
+
+  function discardWorkout() {
+    askConfirm("Discard this workout? Nothing will be saved.", () => {
+      setSession(null);
+      setDraft({});
+      setScreen("home");
+    }, "Discard");
+  }
+
+  async function loadHistory() {
+    setLoading(true);
+    try {
+      const listed = await window.storage.list("sessions:", false);
+      const keys = (listed && listed.keys) || [];
+      const items = [];
+      for (const k of keys) {
+        try {
+          const r = await window.storage.get(k, false);
+          if (r && r.value) items.push(JSON.parse(r.value));
+        } catch (e) {
+          // skip unreadable entry
+        }
+      }
+      items.sort((a, b) => new Date(b.date) - new Date(a.date));
+      setSessions(items);
+    } catch (e) {
+      setSessions([]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function openHistory() {
+    setScreen("history");
+    loadHistory();
+  }
+
+  function deleteSession(id) {
+    askConfirm("Delete this workout log? This can't be undone.", async () => {
+      try {
+        await window.storage.delete(`sessions:${id}`, false);
+        setSessions((s) => s.filter((x) => x.id !== id));
+        setScreen("history");
+      } catch (e) {
+        setError("Couldn't delete that log.");
+      }
+    }, "Delete");
+  }
+
+  function addExercise(day) {
+    const name = newExName.trim();
+    if (!name) return;
+    const next = { ...config, [day]: [...(config[day] || []), name] };
+    saveConfig(next);
+    setNewExName("");
+  }
+
+  function removeExercise(day, idx) {
+    const next = { ...config, [day]: config[day].filter((_, i) => i !== idx) };
+    saveConfig(next);
+  }
+
+  if (loading && !config) {
+    return (
+      <Shell>
+        <div style={{ padding: 40, textAlign: "center", color: "var(--text-muted)" }}>
+          Loading…
+        </div>
+      </Shell>
+    );
+  }
+
+  return (
+    <Shell
+      toast={toast}
+      error={error}
+      onDismissError={() => setError("")}
+      confirmState={confirmState}
+      onConfirmYes={() => {
+        const fn = confirmState && confirmState.onConfirm;
+        setConfirmState(null);
+        if (fn) fn();
+      }}
+      onConfirmNo={() => setConfirmState(null)}
+    >
+      {screen === "home" && (
+        <Home config={config} onPickDay={startWorkout} onManage={() => setScreen("manage")} onHistory={openHistory} />
+      )}
+      {screen === "manage" && (
+        <Manage
+          config={config}
+          manageDay={manageDay}
+          setManageDay={setManageDay}
+          newExName={newExName}
+          setNewExName={setNewExName}
+          onAdd={addExercise}
+          onRemove={removeExercise}
+          onBack={() => setScreen("home")}
+        />
+      )}
+      {screen === "workout" && session && (
+        <Workout
+          session={session}
+          draft={draft}
+          onBeginAddSet={beginAddSet}
+          onUpdatePart={updateDraftPart}
+          onAddDropdown={addDropdown}
+          onRemovePart={removeDraftPart}
+          onSaveSet={saveSet}
+          onCancelSet={cancelAddSet}
+          onDeleteSet={deleteSet}
+          onFinish={finishWorkout}
+          onDiscard={discardWorkout}
+        />
+      )}
+      {screen === "history" && (
+        <History
+          loading={loading}
+          sessions={sessions}
+          onBack={() => setScreen("home")}
+          onOpen={(s) => {
+            setDetailSession(s);
+            setScreen("detail");
+          }}
+        />
+      )}
+      {screen === "detail" && detailSession && (
+        <Detail session={detailSession} onBack={() => setScreen("history")} onDelete={() => deleteSession(detailSession.id)} />
+      )}
+    </Shell>
+  );
+}
+
+function Shell({ children, toast, error, onDismissError, confirmState, onConfirmYes, onConfirmNo }) {
+  return (
+    <div className="gt-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+        .gt-root {
+          --bg: #16171B;
+          --surface: #1F2127;
+          --surface2: #262931;
+          --border: #2E313A;
+          --text: #F2F1ED;
+          --text-muted: #8A8D95;
+          --danger: #E85D4C;
+          font-family: 'Oswald', sans-serif;
+          background: var(--bg);
+          color: var(--text);
+          min-height: 100vh;
+          max-width: 480px;
+          margin: 0 auto;
+          box-sizing: border-box;
+          padding-bottom: 40px;
+        }
+        .gt-root * { box-sizing: border-box; }
+        .gt-mono { font-family: 'JetBrains Mono', monospace; }
+        .gt-header {
+          padding: 28px 20px 16px;
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+        }
+        .gt-title {
+          font-weight: 700;
+          font-size: 26px;
+          letter-spacing: 0.5px;
+          text-transform: uppercase;
+          margin: 0;
+        }
+        .gt-sub {
+          color: var(--text-muted);
+          font-size: 13px;
+          font-family: 'JetBrains Mono', monospace;
+        }
+        .gt-body { padding: 0 20px 20px; }
+        .gt-btn {
+          border: none;
+          border-radius: 10px;
+          padding: 14px 18px;
+          font-family: 'Oswald', sans-serif;
+          font-weight: 600;
+          font-size: 15px;
+          letter-spacing: 0.3px;
+          cursor: pointer;
+          text-transform: uppercase;
+        }
+        .gt-btn-ghost {
+          background: transparent;
+          border: 1px solid var(--border);
+          color: var(--text);
+        }
+        .gt-btn-block { width: 100%; }
+        .gt-link {
+          background: none;
+          border: none;
+          color: var(--text-muted);
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 13px;
+          text-decoration: underline;
+          cursor: pointer;
+          padding: 0;
+        }
+        .gt-toast {
+          position: fixed;
+          bottom: 24px;
+          left: 50%;
+          transform: translateX(-50%);
+          background: var(--surface2);
+          border: 1px solid var(--border);
+          padding: 10px 18px;
+          border-radius: 999px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 13px;
+          z-index: 50;
+        }
+        .gt-error {
+          margin: 0 20px 12px;
+          background: #2A1A18;
+          border: 1px solid var(--danger);
+          color: #FFD9CF;
+          padding: 10px 14px;
+          border-radius: 8px;
+          font-size: 13px;
+          display: flex;
+          justify-content: space-between;
+          gap: 10px;
+        }
+        input[type=number], input[type=text] {
+          background: var(--surface2);
+          border: 1px solid var(--border);
+          color: var(--text);
+          border-radius: 8px;
+          padding: 10px 12px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 15px;
+          width: 100%;
+        }
+        input:focus { outline: 2px solid #4FA3F7; outline-offset: 1px; }
+        .gt-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(0,0,0,0.6);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 20px;
+          z-index: 100;
+        }
+        .gt-modal {
+          background: var(--surface2);
+          border: 1px solid var(--border);
+          border-radius: 12px;
+          padding: 20px;
+          max-width: 360px;
+          width: 100%;
+        }
+        .gt-modal-msg { font-size: 15px; margin-bottom: 18px; line-height: 1.4; }
+        .gt-modal-actions { display: flex; gap: 10px; }
+      `}</style>
+      {error && (
+        <div className="gt-error">
+          <span>{error}</span>
+          <button className="gt-link" onClick={onDismissError}>dismiss</button>
+        </div>
+      )}
+      {children}
+      {toast && <div className="gt-toast">{toast}</div>}
+      {confirmState && (
+        <div className="gt-overlay" onClick={onConfirmNo}>
+          <div className="gt-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="gt-modal-msg">{confirmState.message}</div>
+            <div className="gt-modal-actions">
+              <button className="gt-btn gt-btn-ghost" style={{ flex: 1 }} onClick={onConfirmNo}>
+                Cancel
+              </button>
+              <button
+                className="gt-btn"
+                style={{ flex: 1, background: "var(--danger)", color: "#16171B" }}
+                onClick={onConfirmYes}
+              >
+                {confirmState.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Home({ config, onPickDay, onManage, onHistory }) {
+  return (
+    <div>
+      <div className="gt-header">
+        <div>
+          <h1 className="gt-title">Iron Log</h1>
+          <div className="gt-sub">{todayLabel()}</div>
+        </div>
+      </div>
+      <div className="gt-body">
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 24 }}>
+          {DAYS.map((day) => {
+            const meta = DAY_META[day];
+            const count = (config[day] || []).length;
+            return (
+              <button
+                key={day}
+                onClick={() => onPickDay(day)}
+                className="gt-btn"
+                style={{
+                  background: meta.accentDim,
+                  border: `1px solid ${meta.accent}`,
+                  color: meta.accent,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  padding: "18px 20px",
+                }}
+              >
+                <span style={{ fontSize: 20 }}>{meta.label}</span>
+                <span className="gt-mono" style={{ fontSize: 12, opacity: 0.8 }}>
+                  {count} exercise{count === 1 ? "" : "s"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button className="gt-btn gt-btn-ghost gt-btn-block" onClick={onManage}>
+            Edit exercises
+          </button>
+          <button className="gt-btn gt-btn-ghost gt-btn-block" onClick={onHistory}>
+            History
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Manage({ config, manageDay, setManageDay, newExName, setNewExName, onAdd, onRemove, onBack }) {
+  const meta = DAY_META[manageDay];
+  return (
+    <div>
+      <div className="gt-header">
+        <div>
+          <h1 className="gt-title">Edit Exercises</h1>
+        </div>
+        <button className="gt-link" onClick={onBack}>back</button>
+      </div>
+      <div className="gt-body">
+        <div style={{ display: "flex", gap: 6, marginBottom: 20 }}>
+          {DAYS.map((day) => {
+            const m = DAY_META[day];
+            const active = day === manageDay;
+            return (
+              <button
+                key={day}
+                onClick={() => setManageDay(day)}
+                className="gt-btn"
+                style={{
+                  flex: 1,
+                  padding: "10px 8px",
+                  fontSize: 12,
+                  background: active ? m.accentDim : "transparent",
+                  border: `1px solid ${active ? m.accent : "var(--border)"}`,
+                  color: active ? m.accent : "var(--text-muted)",
+                }}
+              >
+                {m.label}
+              </button>
+            );
+          })}
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+          {(config[manageDay] || []).length === 0 && (
+            <div style={{ color: "var(--text-muted)", fontSize: 14 }}>
+              No exercises yet. Add your first one below.
+            </div>
+          )}
+          {(config[manageDay] || []).map((name, idx) => (
+            <div
+              key={idx}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                background: "var(--surface)",
+                border: "1px solid var(--border)",
+                borderRadius: 8,
+                padding: "10px 14px",
+              }}
+            >
+              <span>{name}</span>
+              <button
+                className="gt-link"
+                style={{ color: meta.accent }}
+                onClick={() => onRemove(manageDay, idx)}
+              >
+                remove
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            type="text"
+            placeholder={`Add ${meta.label.toLowerCase()} exercise`}
+            value={newExName}
+            onChange={(e) => setNewExName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") onAdd(manageDay);
+            }}
+          />
+          <button
+            className="gt-btn"
+            style={{ background: meta.accent, color: "#16171B", whiteSpace: "nowrap" }}
+            onClick={() => onAdd(manageDay)}
+          >
+            Add
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SetChip({ set, accent, onDelete }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        background: "var(--surface2)",
+        border: "1px solid var(--border)",
+        borderRadius: 8,
+        padding: "8px 12px",
+      }}
+    >
+      <span className="gt-mono" style={{ fontSize: 14, color: accent }}>
+        {set.parts.map((p, i) => (
+          <span key={i}>
+            {i > 0 && <span style={{ color: "var(--text-muted)" }}> → </span>}
+            {p.weight}×{p.reps}
+          </span>
+        ))}
+      </span>
+      <button className="gt-link" onClick={onDelete}>×</button>
+    </div>
+  );
+}
+
+function ExerciseCard({ ex, accent, draftParts, onBeginAddSet, onUpdatePart, onAddDropdown, onRemovePart, onSaveSet, onCancelSet, onDeleteSet }) {
+  return (
+    <div
+      style={{
+        background: "var(--surface)",
+        border: "1px solid var(--border)",
+        borderRadius: 12,
+        padding: 14,
+        marginBottom: 14,
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ fontWeight: 600, fontSize: 16 }}>{ex.name}</div>
+        <span className="gt-mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          {ex.sets.length} set{ex.sets.length === 1 ? "" : "s"}
+        </span>
+      </div>
+
+      {ex.sets.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
+          {ex.sets.map((set) => (
+            <SetChip key={set.id} set={set} accent={accent} onDelete={() => onDeleteSet(ex.name, set.id)} />
+          ))}
+        </div>
+      )}
+
+      {!draftParts ? (
+        <button
+          className="gt-btn gt-btn-block"
+          style={{ background: "transparent", border: `1px dashed ${accent}`, color: accent, padding: "10px" }}
+          onClick={() => onBeginAddSet(ex.name)}
+        >
+          + Add set
+        </button>
+      ) : (
+        <div style={{ background: "var(--surface2)", borderRadius: 8, padding: 10 }}>
+          {draftParts.map((p, idx) => (
+            <div key={idx} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
+              <input
+                type="number"
+                inputMode="decimal"
+                placeholder="lbs"
+                value={p.weight}
+                onChange={(e) => onUpdatePart(ex.name, idx, "weight", e.target.value)}
+              />
+              <span style={{ color: "var(--text-muted)" }}>×</span>
+              <input
+                type="number"
+                inputMode="numeric"
+                placeholder="reps"
+                value={p.reps}
+                onChange={(e) => onUpdatePart(ex.name, idx, "reps", e.target.value)}
+              />
+              {draftParts.length > 1 && (
+                <button className="gt-link" onClick={() => onRemovePart(ex.name, idx)}>×</button>
+              )}
+            </div>
+          ))}
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <button className="gt-btn gt-btn-ghost" style={{ flex: 1, fontSize: 12, padding: "8px" }} onClick={() => onAddDropdown(ex.name)}>
+              + Dropset
+            </button>
+            <button className="gt-btn" style={{ flex: 1, background: accent, color: "#16171B", fontSize: 12, padding: "8px" }} onClick={() => onSaveSet(ex.name)}>
+              Save set
+            </button>
+            <button className="gt-btn gt-btn-ghost" style={{ flex: 1, fontSize: 12, padding: "8px" }} onClick={() => onCancelSet(ex.name)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Workout({ session, draft, onBeginAddSet, onUpdatePart, onAddDropdown, onRemovePart, onSaveSet, onCancelSet, onDeleteSet, onFinish, onDiscard }) {
+  const meta = DAY_META[session.day];
+  return (
+    <div>
+      <div className="gt-header">
+        <div>
+          <h1 className="gt-title" style={{ color: meta.accent }}>{meta.label}</h1>
+          <div className="gt-sub">{todayLabel()}</div>
+        </div>
+        <button className="gt-link" onClick={onDiscard}>discard</button>
+      </div>
+      <div className="gt-body">
+        {session.exercises.length === 0 && (
+          <div style={{ color: "var(--text-muted)", marginBottom: 16 }}>
+            No exercises saved for this day yet. Go back and add some in "Edit exercises".
+          </div>
+        )}
+        {session.exercises.map((ex) => (
+          <ExerciseCard
+            key={ex.name}
+            ex={ex}
+            accent={meta.accent}
+            draftParts={draft[ex.name]}
+            onBeginAddSet={onBeginAddSet}
+            onUpdatePart={onUpdatePart}
+            onAddDropdown={onAddDropdown}
+            onRemovePart={onRemovePart}
+            onSaveSet={onSaveSet}
+            onCancelSet={onCancelSet}
+            onDeleteSet={onDeleteSet}
+          />
+        ))}
+        <button
+          className="gt-btn gt-btn-block"
+          style={{ background: meta.accent, color: "#16171B", marginTop: 8, padding: "16px" }}
+          onClick={onFinish}
+        >
+          Finish workout
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function History({ loading, sessions, onBack, onOpen }) {
+  return (
+    <div>
+      <div className="gt-header">
+        <h1 className="gt-title">History</h1>
+        <button className="gt-link" onClick={onBack}>back</button>
+      </div>
+      <div className="gt-body">
+        {loading && <div style={{ color: "var(--text-muted)" }}>Loading…</div>}
+        {!loading && sessions.length === 0 && (
+          <div style={{ color: "var(--text-muted)" }}>No workouts logged yet.</div>
+        )}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {sessions.map((s) => {
+            const meta = DAY_META[s.day];
+            const totalSets = s.exercises.reduce((n, ex) => n + ex.sets.length, 0);
+            return (
+              <button
+                key={s.id}
+                onClick={() => onOpen(s)}
+                className="gt-btn"
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  background: "var(--surface)",
+                  border: `1px solid var(--border)`,
+                  padding: "14px 16px",
+                }}
+              >
+                <span style={{ color: meta.accent }}>{meta.label}</span>
+                <span className="gt-mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                  {new Date(s.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })} · {totalSets} sets
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Detail({ session, onBack, onDelete }) {
+  const meta = DAY_META[session.day];
+  return (
+    <div>
+      <div className="gt-header">
+        <div>
+          <h1 className="gt-title" style={{ color: meta.accent }}>{meta.label}</h1>
+          <div className="gt-sub">{new Date(session.date).toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}</div>
+        </div>
+        <button className="gt-link" onClick={onBack}>back</button>
+      </div>
+      <div className="gt-body">
+        {session.exercises.filter((ex) => ex.sets.length > 0).length === 0 && (
+          <div style={{ color: "var(--text-muted)" }}>No sets were logged this session.</div>
+        )}
+        {session.exercises
+          .filter((ex) => ex.sets.length > 0)
+          .map((ex) => (
+            <div key={ex.name} style={{ marginBottom: 16 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>{ex.name}</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {ex.sets.map((set) => (
+                  <div key={set.id} className="gt-mono" style={{ fontSize: 14, color: meta.accent }}>
+                    {set.parts.map((p, i) => (
+                      <span key={i}>
+                        {i > 0 && <span style={{ color: "var(--text-muted)" }}> → </span>}
+                        {p.weight}×{p.reps}
+                      </span>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        <button className="gt-btn gt-btn-block" style={{ background: "transparent", border: "1px solid var(--danger)", color: "var(--danger)", marginTop: 10 }} onClick={onDelete}>
+          Delete this log
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<GymTracker />);
+</script>
+
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
