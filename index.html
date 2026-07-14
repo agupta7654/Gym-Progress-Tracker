@@ -46,7 +46,6 @@ window.storage = {
 <script id="app-source" type="text/plain">
 const { useState, useEffect, useCallback } = React;
 
-
 const DAYS = ["push", "pull", "legs", "abs"];
 
 const DAY_META = {
@@ -75,27 +74,47 @@ function todayLabel() {
   });
 }
 
+function cloneSession(s) {
+  return JSON.parse(JSON.stringify(s));
+}
+
+// Find the most recent completed (not currently being edited) session that
+// logged this exercise, and return its sets.
+function findPreviousForExercise(sessions, exerciseName, excludeId) {
+  for (const s of sessions) {
+    if (s.id === excludeId) continue;
+    const ex = s.exercises.find((e) => e.name === exerciseName && e.sets.length > 0);
+    if (ex) return { date: s.date, sets: ex.sets };
+  }
+  return null;
+}
+
 function GymTracker() {
-  const [screen, setScreen] = useState("home"); // home | manage | workout | history | detail
+  const [screen, setScreen] = useState("home"); // home | manage | workout | history | detail | backup
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
 
-  const [session, setSession] = useState(null); // active workout session
+  // workingSession covers BOTH a live in-progress workout and an edit of a
+  // past finished workout. mode: 'live' | 'edit'
+  const [workingSession, setWorkingSession] = useState(null);
   const [draft, setDraft] = useState({}); // exerciseName -> array of {weight, reps}
   const [manageDay, setManageDay] = useState("push");
   const [newExName, setNewExName] = useState("");
 
-  const [sessions, setSessions] = useState([]); // history list
+  const [sessions, setSessions] = useState([]); // all saved sessions, newest first
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [detailSession, setDetailSession] = useState(null);
+  const [resumable, setResumable] = useState(null); // unfinished live workout found on load
   const [confirmState, setConfirmState] = useState(null); // {message, confirmLabel, onConfirm}
+  const [importBusy, setImportBusy] = useState(false);
 
   function askConfirm(message, onConfirm, confirmLabel) {
     setConfirmState({ message, onConfirm, confirmLabel: confirmLabel || "Confirm" });
   }
 
-  // ---- load config on mount ----
+  // ---- load config + sessions + any in-progress workout on mount ----
   useEffect(() => {
     (async () => {
       try {
@@ -108,15 +127,55 @@ function GymTracker() {
         }
       } catch (e) {
         setConfig(DEFAULT_CONFIG);
-      } finally {
-        setLoading(false);
       }
+
+      await refreshSessions();
+
+      try {
+        const active = await window.storage.get("activeSession");
+        if (active && active.value) {
+          setResumable(JSON.parse(active.value));
+        }
+      } catch (e) {
+        // no in-progress workout saved, nothing to do
+      }
+
+      setLoading(false);
     })();
   }, []);
+
+  // auto-save the live workout as it changes, so closing the app mid-workout
+  // doesn't lose progress
+  useEffect(() => {
+    if (workingSession && workingSession.mode === "live") {
+      window.storage.set("activeSession", JSON.stringify(workingSession), false).catch(() => {});
+    }
+  }, [workingSession]);
 
   function showToast(msg) {
     setToast(msg);
     setTimeout(() => setToast(""), 1800);
+  }
+
+  async function refreshSessions() {
+    try {
+      const listed = await window.storage.list("sessions:", false);
+      const keys = (listed && listed.keys) || [];
+      const items = [];
+      for (const k of keys) {
+        try {
+          const r = await window.storage.get(k, false);
+          if (r && r.value) items.push(JSON.parse(r.value));
+        } catch (e) {
+          // skip unreadable entry
+        }
+      }
+      items.sort((a, b) => new Date(b.date) - new Date(a.date));
+      setSessions(items);
+      setSessionsLoaded(true);
+    } catch (e) {
+      setSessionsLoaded(true);
+    }
   }
 
   async function saveConfig(next) {
@@ -130,7 +189,29 @@ function GymTracker() {
 
   function startWorkout(day) {
     const exercises = (config[day] || []).map((name) => ({ name, sets: [] }));
-    setSession({ id: uid(), day, date: new Date().toISOString(), exercises });
+    setWorkingSession({ id: uid(), day, date: new Date().toISOString(), exercises, mode: "live" });
+    setDraft({});
+    setScreen("workout");
+  }
+
+  function resumeWorkout() {
+    setWorkingSession({ ...resumable, mode: "live" });
+    setDraft({});
+    setResumable(null);
+    setScreen("workout");
+  }
+
+  function discardResumable() {
+    askConfirm("Discard this unfinished workout? Nothing will be saved.", async () => {
+      try {
+        await window.storage.delete("activeSession", false);
+      } catch (e) {}
+      setResumable(null);
+    }, "Discard");
+  }
+
+  function startEditingSession(s) {
+    setWorkingSession({ ...cloneSession(s), mode: "edit" });
     setDraft({});
     setScreen("workout");
   }
@@ -173,7 +254,7 @@ function GymTracker() {
       cancelAddSet(exName);
       return;
     }
-    setSession((s) => ({
+    setWorkingSession((s) => ({
       ...s,
       exercises: s.exercises.map((ex) =>
         ex.name === exName ? { ...ex, sets: [...ex.sets, { id: uid(), parts }] } : ex
@@ -183,7 +264,7 @@ function GymTracker() {
   }
 
   function deleteSet(exName, setId) {
-    setSession((s) => ({
+    setWorkingSession((s) => ({
       ...s,
       exercises: s.exercises.map((ex) =>
         ex.name === exName ? { ...ex, sets: ex.sets.filter((st) => st.id !== setId) } : ex
@@ -193,18 +274,44 @@ function GymTracker() {
 
   async function actuallyFinishWorkout() {
     try {
-      await window.storage.set(`sessions:${session.id}`, JSON.stringify(session), false);
+      await window.storage.set(`sessions:${workingSession.id}`, JSON.stringify(workingSession), false);
+      await window.storage.delete("activeSession", false);
       showToast("Workout saved");
+      setSessions((prev) => {
+        const withoutOld = prev.filter((s) => s.id !== workingSession.id);
+        const next = [...withoutOld, workingSession];
+        next.sort((a, b) => new Date(b.date) - new Date(a.date));
+        return next;
+      });
     } catch (e) {
       setError("Couldn't save your workout.");
     }
-    setSession(null);
+    setWorkingSession(null);
     setScreen("home");
   }
 
-  function finishWorkout() {
-    if (!session) return;
-    const hasAnySets = session.exercises.some((ex) => ex.sets.length > 0);
+  function finishOrSaveWorkout() {
+    if (!workingSession) return;
+    if (workingSession.mode === "edit") {
+      (async () => {
+        try {
+          await window.storage.set(`sessions:${workingSession.id}`, JSON.stringify(workingSession), false);
+          setSessions((prev) => {
+            const next = prev.map((s) => (s.id === workingSession.id ? workingSession : s));
+            next.sort((a, b) => new Date(b.date) - new Date(a.date));
+            return next;
+          });
+          setDetailSession(workingSession);
+          showToast("Changes saved");
+        } catch (e) {
+          setError("Couldn't save your changes.");
+        }
+        setWorkingSession(null);
+        setScreen("detail");
+      })();
+      return;
+    }
+    const hasAnySets = workingSession.exercises.some((ex) => ex.sets.length > 0);
     if (!hasAnySets) {
       askConfirm("No sets logged. Finish anyway?", actuallyFinishWorkout, "Finish");
       return;
@@ -212,40 +319,26 @@ function GymTracker() {
     actuallyFinishWorkout();
   }
 
-  function discardWorkout() {
-    askConfirm("Discard this workout? Nothing will be saved.", () => {
-      setSession(null);
+  function discardOrCancelWorkout() {
+    if (!workingSession) return;
+    if (workingSession.mode === "edit") {
+      setWorkingSession(null);
+      setScreen("detail");
+      return;
+    }
+    askConfirm("Discard this workout? Nothing will be saved.", async () => {
+      try {
+        await window.storage.delete("activeSession", false);
+      } catch (e) {}
+      setWorkingSession(null);
       setDraft({});
       setScreen("home");
     }, "Discard");
   }
 
-  async function loadHistory() {
-    setLoading(true);
-    try {
-      const listed = await window.storage.list("sessions:", false);
-      const keys = (listed && listed.keys) || [];
-      const items = [];
-      for (const k of keys) {
-        try {
-          const r = await window.storage.get(k, false);
-          if (r && r.value) items.push(JSON.parse(r.value));
-        } catch (e) {
-          // skip unreadable entry
-        }
-      }
-      items.sort((a, b) => new Date(b.date) - new Date(a.date));
-      setSessions(items);
-    } catch (e) {
-      setSessions([]);
-    } finally {
-      setLoading(false);
-    }
-  }
-
   function openHistory() {
     setScreen("history");
-    loadHistory();
+    if (!sessionsLoaded) refreshSessions();
   }
 
   function deleteSession(id) {
@@ -273,6 +366,47 @@ function GymTracker() {
     saveConfig(next);
   }
 
+  async function exportBackup() {
+    try {
+      const payload = { exportedAt: new Date().toISOString(), config, sessions };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const stamp = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `iron-log-backup-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast("Backup downloaded");
+    } catch (e) {
+      setError("Couldn't create the backup file.");
+    }
+  }
+
+  async function importBackup(file) {
+    setImportBusy(true);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object" || !parsed.sessions || !parsed.config) {
+        throw new Error("That file doesn't look like an Iron Log backup.");
+      }
+      await window.storage.set("config", JSON.stringify(parsed.config), false);
+      for (const s of parsed.sessions) {
+        await window.storage.set(`sessions:${s.id}`, JSON.stringify(s), false);
+      }
+      setConfig(parsed.config);
+      await refreshSessions();
+      showToast("Backup imported");
+    } catch (e) {
+      setError(e.message || "Couldn't import that backup file.");
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
   if (loading && !config) {
     return (
       <Shell>
@@ -297,7 +431,16 @@ function GymTracker() {
       onConfirmNo={() => setConfirmState(null)}
     >
       {screen === "home" && (
-        <Home config={config} onPickDay={startWorkout} onManage={() => setScreen("manage")} onHistory={openHistory} />
+        <Home
+          config={config}
+          resumable={resumable}
+          onPickDay={startWorkout}
+          onManage={() => setScreen("manage")}
+          onHistory={openHistory}
+          onBackup={() => setScreen("backup")}
+          onResume={resumeWorkout}
+          onDiscardResumable={discardResumable}
+        />
       )}
       {screen === "manage" && (
         <Manage
@@ -311,10 +454,11 @@ function GymTracker() {
           onBack={() => setScreen("home")}
         />
       )}
-      {screen === "workout" && session && (
+      {screen === "workout" && workingSession && (
         <Workout
-          session={session}
+          workingSession={workingSession}
           draft={draft}
+          sessions={sessions}
           onBeginAddSet={beginAddSet}
           onUpdatePart={updateDraftPart}
           onAddDropdown={addDropdown}
@@ -322,13 +466,13 @@ function GymTracker() {
           onSaveSet={saveSet}
           onCancelSet={cancelAddSet}
           onDeleteSet={deleteSet}
-          onFinish={finishWorkout}
-          onDiscard={discardWorkout}
+          onFinish={finishOrSaveWorkout}
+          onDiscard={discardOrCancelWorkout}
         />
       )}
       {screen === "history" && (
         <History
-          loading={loading}
+          loading={!sessionsLoaded}
           sessions={sessions}
           onBack={() => setScreen("home")}
           onOpen={(s) => {
@@ -338,7 +482,20 @@ function GymTracker() {
         />
       )}
       {screen === "detail" && detailSession && (
-        <Detail session={detailSession} onBack={() => setScreen("history")} onDelete={() => deleteSession(detailSession.id)} />
+        <Detail
+          session={detailSession}
+          onBack={() => setScreen("history")}
+          onDelete={() => deleteSession(detailSession.id)}
+          onEdit={() => startEditingSession(detailSession)}
+        />
+      )}
+      {screen === "backup" && (
+        <Backup
+          onBack={() => setScreen("home")}
+          onExport={exportBackup}
+          onImport={importBackup}
+          importBusy={importBusy}
+        />
       )}
     </Shell>
   );
@@ -370,10 +527,11 @@ function Shell({ children, toast, error, onDismissError, confirmState, onConfirm
         .gt-root * { box-sizing: border-box; }
         .gt-mono { font-family: 'JetBrains Mono', monospace; }
         .gt-header {
-          padding: 28px 20px 16px;
+          padding: calc(env(safe-area-inset-top, 0px) + 38px) 20px 16px;
           display: flex;
-          align-items: baseline;
+          align-items: flex-start;
           justify-content: space-between;
+          gap: 10px;
         }
         .gt-title {
           font-weight: 700;
@@ -405,6 +563,21 @@ function Shell({ children, toast, error, onDismissError, confirmState, onConfirm
           color: var(--text);
         }
         .gt-btn-block { width: 100%; }
+        .gt-headbtn {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          color: var(--text-muted);
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 12px;
+          text-transform: none;
+          letter-spacing: 0;
+          border-radius: 8px;
+          padding: 10px 14px;
+          min-height: 40px;
+          min-width: 40px;
+          cursor: pointer;
+          flex-shrink: 0;
+        }
         .gt-link {
           background: none;
           border: none;
@@ -413,7 +586,7 @@ function Shell({ children, toast, error, onDismissError, confirmState, onConfirm
           font-size: 13px;
           text-decoration: underline;
           cursor: pointer;
-          padding: 0;
+          padding: 6px 2px;
         }
         .gt-toast {
           position: fixed;
@@ -429,7 +602,7 @@ function Shell({ children, toast, error, onDismissError, confirmState, onConfirm
           z-index: 50;
         }
         .gt-error {
-          margin: 0 20px 12px;
+          margin: 12px 20px 0;
           background: #2A1A18;
           border: 1px solid var(--danger);
           color: #FFD9CF;
@@ -503,7 +676,7 @@ function Shell({ children, toast, error, onDismissError, confirmState, onConfirm
   );
 }
 
-function Home({ config, onPickDay, onManage, onHistory }) {
+function Home({ config, resumable, onPickDay, onManage, onHistory, onBackup, onResume, onDiscardResumable }) {
   return (
     <div>
       <div className="gt-header">
@@ -513,6 +686,42 @@ function Home({ config, onPickDay, onManage, onHistory }) {
         </div>
       </div>
       <div className="gt-body">
+        {resumable && (
+          <div
+            style={{
+              background: "var(--surface)",
+              border: `1px solid ${DAY_META[resumable.day].accent}`,
+              borderRadius: 12,
+              padding: 14,
+              marginBottom: 20,
+            }}
+          >
+            <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 8 }}>
+              Unfinished workout
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <span style={{ color: DAY_META[resumable.day].accent, fontWeight: 600, fontSize: 18 }}>
+                {DAY_META[resumable.day].label}
+              </span>
+              <span className="gt-mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                {resumable.exercises.reduce((n, ex) => n + ex.sets.length, 0)} sets logged
+              </span>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                className="gt-btn"
+                style={{ flex: 1, background: DAY_META[resumable.day].accent, color: "#16171B" }}
+                onClick={onResume}
+              >
+                Resume
+              </button>
+              <button className="gt-btn gt-btn-ghost" style={{ flex: 1 }} onClick={onDiscardResumable}>
+                Discard
+              </button>
+            </div>
+          </div>
+        )}
+
         <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 24 }}>
           {DAYS.map((day) => {
             const meta = DAY_META[day];
@@ -540,7 +749,7 @@ function Home({ config, onPickDay, onManage, onHistory }) {
             );
           })}
         </div>
-        <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
           <button className="gt-btn gt-btn-ghost gt-btn-block" onClick={onManage}>
             Edit exercises
           </button>
@@ -548,6 +757,9 @@ function Home({ config, onPickDay, onManage, onHistory }) {
             History
           </button>
         </div>
+        <button className="gt-btn gt-btn-ghost gt-btn-block" onClick={onBackup}>
+          Backup &amp; restore
+        </button>
       </div>
     </div>
   );
@@ -561,7 +773,7 @@ function Manage({ config, manageDay, setManageDay, newExName, setNewExName, onAd
         <div>
           <h1 className="gt-title">Edit Exercises</h1>
         </div>
-        <button className="gt-link" onClick={onBack}>back</button>
+        <button className="gt-headbtn" onClick={onBack}>Back</button>
       </div>
       <div className="gt-body">
         <div style={{ display: "flex", gap: 6, marginBottom: 20 }}>
@@ -668,7 +880,20 @@ function SetChip({ set, accent, onDelete }) {
   );
 }
 
-function ExerciseCard({ ex, accent, draftParts, onBeginAddSet, onUpdatePart, onAddDropdown, onRemovePart, onSaveSet, onCancelSet, onDeleteSet }) {
+function ExerciseCard({
+  ex,
+  accent,
+  draftParts,
+  previous,
+  onBeginAddSet,
+  onUpdatePart,
+  onAddDropdown,
+  onRemovePart,
+  onSaveSet,
+  onCancelSet,
+  onDeleteSet,
+}) {
+  const [showPrev, setShowPrev] = useState(false);
   return (
     <div
       style={{
@@ -679,12 +904,51 @@ function ExerciseCard({ ex, accent, draftParts, onBeginAddSet, onUpdatePart, onA
         marginBottom: 14,
       }}
     >
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 8 }}>
         <div style={{ fontWeight: 600, fontSize: 16 }}>{ex.name}</div>
-        <span className="gt-mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
-          {ex.sets.length} set{ex.sets.length === 1 ? "" : "s"}
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+          {previous && (
+            <button
+              className="gt-link"
+              style={{ color: accent, textDecoration: "none", border: `1px solid ${accent}`, borderRadius: 6, padding: "4px 8px" }}
+              onClick={() => setShowPrev((v) => !v)}
+            >
+              {showPrev ? "Hide" : "Show"} previous
+            </button>
+          )}
+          <span className="gt-mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+            {ex.sets.length} set{ex.sets.length === 1 ? "" : "s"}
+          </span>
+        </div>
       </div>
+
+      {showPrev && previous && (
+        <div
+          style={{
+            background: "var(--surface2)",
+            border: "1px solid var(--border)",
+            borderRadius: 8,
+            padding: "8px 12px",
+            marginBottom: 10,
+          }}
+        >
+          <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>
+            Last time ({new Date(previous.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })})
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {previous.sets.map((set, i) => (
+              <div key={i} className="gt-mono" style={{ fontSize: 13, color: "var(--text-muted)" }}>
+                {set.parts.map((p, j) => (
+                  <span key={j}>
+                    {j > 0 && <span> → </span>}
+                    {p.weight}×{p.reps}
+                  </span>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {ex.sets.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
@@ -743,29 +1007,48 @@ function ExerciseCard({ ex, accent, draftParts, onBeginAddSet, onUpdatePart, onA
   );
 }
 
-function Workout({ session, draft, onBeginAddSet, onUpdatePart, onAddDropdown, onRemovePart, onSaveSet, onCancelSet, onDeleteSet, onFinish, onDiscard }) {
-  const meta = DAY_META[session.day];
+function Workout({
+  workingSession,
+  draft,
+  sessions,
+  onBeginAddSet,
+  onUpdatePart,
+  onAddDropdown,
+  onRemovePart,
+  onSaveSet,
+  onCancelSet,
+  onDeleteSet,
+  onFinish,
+  onDiscard,
+}) {
+  const meta = DAY_META[workingSession.day];
+  const isEdit = workingSession.mode === "edit";
   return (
     <div>
       <div className="gt-header">
         <div>
           <h1 className="gt-title" style={{ color: meta.accent }}>{meta.label}</h1>
-          <div className="gt-sub">{todayLabel()}</div>
+          <div className="gt-sub">
+            {isEdit
+              ? `Editing · ${new Date(workingSession.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}`
+              : todayLabel()}
+          </div>
         </div>
-        <button className="gt-link" onClick={onDiscard}>discard</button>
+        <button className="gt-headbtn" onClick={onDiscard}>{isEdit ? "Cancel" : "Discard"}</button>
       </div>
       <div className="gt-body">
-        {session.exercises.length === 0 && (
+        {workingSession.exercises.length === 0 && (
           <div style={{ color: "var(--text-muted)", marginBottom: 16 }}>
             No exercises saved for this day yet. Go back and add some in "Edit exercises".
           </div>
         )}
-        {session.exercises.map((ex) => (
+        {workingSession.exercises.map((ex) => (
           <ExerciseCard
             key={ex.name}
             ex={ex}
             accent={meta.accent}
             draftParts={draft[ex.name]}
+            previous={findPreviousForExercise(sessions, ex.name, workingSession.id)}
             onBeginAddSet={onBeginAddSet}
             onUpdatePart={onUpdatePart}
             onAddDropdown={onAddDropdown}
@@ -780,7 +1063,7 @@ function Workout({ session, draft, onBeginAddSet, onUpdatePart, onAddDropdown, o
           style={{ background: meta.accent, color: "#16171B", marginTop: 8, padding: "16px" }}
           onClick={onFinish}
         >
-          Finish workout
+          {isEdit ? "Save changes" : "Finish workout"}
         </button>
       </div>
     </div>
@@ -792,7 +1075,7 @@ function History({ loading, sessions, onBack, onOpen }) {
     <div>
       <div className="gt-header">
         <h1 className="gt-title">History</h1>
-        <button className="gt-link" onClick={onBack}>back</button>
+        <button className="gt-headbtn" onClick={onBack}>Back</button>
       </div>
       <div className="gt-body">
         {loading && <div style={{ color: "var(--text-muted)" }}>Loading…</div>}
@@ -830,7 +1113,7 @@ function History({ loading, sessions, onBack, onOpen }) {
   );
 }
 
-function Detail({ session, onBack, onDelete }) {
+function Detail({ session, onBack, onDelete, onEdit }) {
   const meta = DAY_META[session.day];
   return (
     <div>
@@ -839,7 +1122,7 @@ function Detail({ session, onBack, onDelete }) {
           <h1 className="gt-title" style={{ color: meta.accent }}>{meta.label}</h1>
           <div className="gt-sub">{new Date(session.date).toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}</div>
         </div>
-        <button className="gt-link" onClick={onBack}>back</button>
+        <button className="gt-headbtn" onClick={onBack}>Back</button>
       </div>
       <div className="gt-body">
         {session.exercises.filter((ex) => ex.sets.length > 0).length === 0 && (
@@ -864,9 +1147,62 @@ function Detail({ session, onBack, onDelete }) {
               </div>
             </div>
           ))}
-        <button className="gt-btn gt-btn-block" style={{ background: "transparent", border: "1px solid var(--danger)", color: "var(--danger)", marginTop: 10 }} onClick={onDelete}>
-          Delete this log
-        </button>
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <button className="gt-btn gt-btn-ghost gt-btn-block" onClick={onEdit}>
+            Edit this workout
+          </button>
+          <button className="gt-btn gt-btn-block" style={{ background: "transparent", border: "1px solid var(--danger)", color: "var(--danger)" }} onClick={onDelete}>
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Backup({ onBack, onExport, onImport, importBusy }) {
+  const fileInputRef = React.useRef(null);
+  return (
+    <div>
+      <div className="gt-header">
+        <h1 className="gt-title">Backup</h1>
+        <button className="gt-headbtn" onClick={onBack}>Back</button>
+      </div>
+      <div className="gt-body">
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>Export</div>
+          <div style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 12, lineHeight: 1.4 }}>
+            Download every exercise and workout log as a single file. Keep it somewhere safe (Files, iCloud, Google Drive) as a backup.
+          </div>
+          <button className="gt-btn gt-btn-block" style={{ background: "#4FA3F7", color: "#16171B" }} onClick={onExport}>
+            Download backup
+          </button>
+        </div>
+
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>Import</div>
+          <div style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 12, lineHeight: 1.4 }}>
+            Restore from a previously downloaded backup file. This adds to what's already saved.
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const file = e.target.files && e.target.files[0];
+              if (file) onImport(file);
+              e.target.value = "";
+            }}
+          />
+          <button
+            className="gt-btn gt-btn-ghost gt-btn-block"
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
+            disabled={importBusy}
+          >
+            {importBusy ? "Importing…" : "Choose backup file"}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -874,6 +1210,7 @@ function Detail({ session, onBack, onDelete }) {
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<GymTracker />);
+
 </script>
 
 <script>
