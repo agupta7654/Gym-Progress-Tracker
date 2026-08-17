@@ -44,11 +44,17 @@ window.storage = {
 </script>
 
 <script id="app-source" type="text/plain">
+
 const { useState, useEffect, useCallback } = React;
 
-const DAYS = ["push", "pull", "legs", "abs"];
+const PRIMARY_DAYS = ["chestback", "sharms", "legsabs"];
+const PPLA_DAYS = ["push", "pull", "legs", "abs"];
+const ALL_DAYS = [...PRIMARY_DAYS, ...PPLA_DAYS];
 
 const DAY_META = {
+  chestback: { label: "Chest & Back", accent: "#B667F1", accentDim: "#2a1f38" },
+  sharms: { label: "SHARMS", accent: "#F16785", accentDim: "#38202a" },
+  legsabs: { label: "Legs & Abs", accent: "#67D9F1", accentDim: "#1f3238" },
   push: { label: "Push", accent: "#FF6B4A", accentDim: "#3a2620" },
   pull: { label: "Pull", accent: "#4FA3F7", accentDim: "#1f2b38" },
   legs: { label: "Legs", accent: "#6FE07A", accentDim: "#213328" },
@@ -56,6 +62,9 @@ const DAY_META = {
 };
 
 const DEFAULT_CONFIG = {
+  chestback: [],
+  sharms: [],
+  legsabs: [],
   push: ["Bench Press", "Overhead Press", "Incline DB Press", "Triceps Pushdown"],
   pull: ["Deadlift", "Barbell Row", "Lat Pulldown", "Bicep Curl"],
   legs: ["Squat", "Leg Press", "Romanian Deadlift", "Calf Raise"],
@@ -90,7 +99,7 @@ function findPreviousForExercise(sessions, exerciseName, excludeId) {
 }
 
 function GymTracker() {
-  const [screen, setScreen] = useState("home"); // home | manage | workout | history | detail | backup
+  const [screen, setScreen] = useState("home"); // home | ppla | manage | workout | history | detail | backup
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -100,7 +109,7 @@ function GymTracker() {
   // past finished workout. mode: 'live' | 'edit'
   const [workingSession, setWorkingSession] = useState(null);
   const [draft, setDraft] = useState({}); // exerciseName -> array of {weight, reps}
-  const [manageDay, setManageDay] = useState("push");
+  const [manageDay, setManageDay] = useState("chestback");
   const [newExName, setNewExName] = useState("");
 
   const [sessions, setSessions] = useState([]); // all saved sessions, newest first
@@ -438,9 +447,13 @@ function GymTracker() {
           onManage={() => setScreen("manage")}
           onHistory={openHistory}
           onBackup={() => setScreen("backup")}
+          onPpla={() => setScreen("ppla")}
           onResume={resumeWorkout}
           onDiscardResumable={discardResumable}
         />
+      )}
+      {screen === "ppla" && (
+        <Ppla config={config} onPickDay={startWorkout} onBack={() => setScreen("home")} />
       )}
       {screen === "manage" && (
         <Manage
@@ -676,7 +689,7 @@ function Shell({ children, toast, error, onDismissError, confirmState, onConfirm
   );
 }
 
-function Home({ config, resumable, onPickDay, onManage, onHistory, onBackup, onResume, onDiscardResumable }) {
+function Home({ config, resumable, onPickDay, onManage, onHistory, onBackup, onPpla, onResume, onDiscardResumable }) {
   return (
     <div>
       <div className="gt-header">
@@ -723,7 +736,7 @@ function Home({ config, resumable, onPickDay, onManage, onHistory, onBackup, onR
         )}
 
         <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 24 }}>
-          {DAYS.map((day) => {
+          {PRIMARY_DAYS.map((day) => {
             const meta = DAY_META[day];
             const count = (config[day] || []).length;
             return (
@@ -757,9 +770,55 @@ function Home({ config, resumable, onPickDay, onManage, onHistory, onBackup, onR
             History
           </button>
         </div>
-        <button className="gt-btn gt-btn-ghost gt-btn-block" onClick={onBackup}>
+        <button className="gt-btn gt-btn-ghost gt-btn-block" onClick={onBackup} style={{ marginBottom: 10 }}>
           Backup &amp; restore
         </button>
+        <button className="gt-btn gt-btn-ghost gt-btn-block" onClick={onPpla}>
+          PPLA
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Ppla({ config, onPickDay, onBack }) {
+  return (
+    <div>
+      <div className="gt-header">
+        <div>
+          <h1 className="gt-title">PPLA</h1>
+          <div className="gt-sub">The original 4-day split</div>
+        </div>
+        <button className="gt-headbtn" onClick={onBack}>Back</button>
+      </div>
+      <div className="gt-body">
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {PPLA_DAYS.map((day) => {
+            const meta = DAY_META[day];
+            const count = (config[day] || []).length;
+            return (
+              <button
+                key={day}
+                onClick={() => onPickDay(day)}
+                className="gt-btn"
+                style={{
+                  background: meta.accentDim,
+                  border: `1px solid ${meta.accent}`,
+                  color: meta.accent,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  padding: "18px 20px",
+                }}
+              >
+                <span style={{ fontSize: 20 }}>{meta.label}</span>
+                <span className="gt-mono" style={{ fontSize: 12, opacity: 0.8 }}>
+                  {count} exercise{count === 1 ? "" : "s"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
@@ -776,8 +835,8 @@ function Manage({ config, manageDay, setManageDay, newExName, setNewExName, onAd
         <button className="gt-headbtn" onClick={onBack}>Back</button>
       </div>
       <div className="gt-body">
-        <div style={{ display: "flex", gap: 6, marginBottom: 20 }}>
-          {DAYS.map((day) => {
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 20 }}>
+          {ALL_DAYS.map((day) => {
             const m = DAY_META[day];
             const active = day === manageDay;
             return (
@@ -786,8 +845,8 @@ function Manage({ config, manageDay, setManageDay, newExName, setNewExName, onAd
                 onClick={() => setManageDay(day)}
                 className="gt-btn"
                 style={{
-                  flex: 1,
-                  padding: "10px 8px",
+                  flex: "1 1 30%",
+                  padding: "10px 6px",
                   fontSize: 12,
                   background: active ? m.accentDim : "transparent",
                   border: `1px solid ${active ? m.accent : "var(--border)"}`,
@@ -1210,6 +1269,7 @@ function Backup({ onBack, onExport, onImport, importBusy }) {
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<GymTracker />);
+
 
 </script>
 
